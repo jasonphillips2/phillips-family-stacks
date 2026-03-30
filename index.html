@@ -1239,19 +1239,27 @@ function renderHotCards(el, results, type){
   if(!el) return;
   const isC = type==='crypto';
   if(!results||results.length===0){
-    el.innerHTML=`<div class="hot-empty">${isC?'No clear movers right now 📉 — tap ↻ refresh or check back later':'No clear movers right now — tap ↻ refresh or check individual stocks 📉'}</div>`;
+    el.innerHTML=`<div class="hot-empty">${isC?'No top movers found — tap ↻ refresh or check back later':'No top movers found — tap ↻ refresh or check individual stocks'}</div>`;
     return;
   }
   el.innerHTML = results.map(r=>{
-    const sigColor = r.sig.signal==='BUY'
-      ? (isC?'hot-card-sig-crypto':'')
-      : 'hot-card-sig-wait';
+    const isBuy = r.sig.signal==='BUY';
+    const sigCls = isBuy ? (isC?'hot-card-sig-crypto':'') : 'hot-card-sig-wait';
+    // mini confidence dots — show how close to BUY
+    const dotCls = isBuy ? (isC?'var(--amber)':'var(--green)') : 'var(--dim)';
+    const filledDots = r.sig.bulls;
+    const dots = Array.from({length:5},(_,i)=>
+      `<span style="display:inline-block;width:5px;height:5px;border-radius:50%;margin:0 1px;background:${i<filledDots?(isBuy?(isC?'var(--amber)':'var(--green)'):'var(--amber)'):'var(--border)'};"></span>`
+    ).join('');
     return`<div class="hot-card ${isC?'hot-card-crypto':''}" onclick="showView('detail','${r.ticker}','${type}')">
       <div class="hot-card-emoji">${r.emoji}</div>
       <div class="hot-card-ticker">${r.ticker}</div>
       <div class="hot-card-name">${r.name}</div>
       <div class="hot-card-chg ${cc(r.chgV)}">${r.chgV>=0?'+':''}${r.chgV.toFixed(2)}%</div>
-      <div class="hot-card-sig ${sigColor}">${r.sig.signal}</div>
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-top:5px;">
+        <div class="hot-card-sig ${sigCls}">${r.sig.signal}</div>
+        <div style="line-height:1;">${dots}</div>
+      </div>
     </div>`;
   }).join('');
 }
@@ -1342,7 +1350,7 @@ function renderMarkets(){
   const hotElId = isC ? 'hotCryptoEl' : 'hotScrollEl';
   const hotIcon = isC ? '🚀' : '🔥';
   const hotTitle = isC ? 'Hot Crypto Right Now' : 'Hot Stocks Today';
-  const hotSub = isC ? 'Top 24h gainers with BUY signals' : 'Top day gainers with BUY signals';
+  const hotSub = isC ? 'Top 24h movers — tap any to see full signal' : 'Top day movers — tap any to see full signal';
   const cachedAge = hotCacheValid(isC?'crypto':'stocks') ? 'updated '+hotCacheAge(isC?'crypto':'stocks') : '';
   const preload = hotCacheValid(isC?'crypto':'stocks')
     ? '' // will render immediately from cache
