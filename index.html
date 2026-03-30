@@ -2172,7 +2172,7 @@ function showTradeDetail(ticker, type, date){
   openModal('learnModal');
 }
 
-
+function showShareCard(){
   const p=state.profile,pCfg=PCFG.find(x=>x.id===state.profileId);
   const lv=Object.entries(p.holdings).reduce((s,[t,h])=>{const cache=h.type==='crypto'?cryptoCache[t]:stockCache[t];return s+(cache?.price||h.avgPrice)*h.shares;},0);
   const total=p.cash+lv,diff=total-1000000,ret=(diff/1000000)*100;
