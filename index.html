@@ -1169,6 +1169,13 @@ async function fetchHotCrypto(){
   return results.sort((a,b)=>b.chgPct-a.chgPct);
 }
 
+// quick pre-screen using only data already returned — no extra fetch needed
+function quickScreen(chgPct){
+  if(chgPct > 3)  return 'STRONG';
+  if(chgPct > -2) return 'WATCH';
+  return 'SKIP';
+}
+
 async function loadHotMovers(type){
   const elId = type==='crypto' ? 'hotCryptoEl' : 'hotScrollEl';
   const el = document.getElementById(elId);
@@ -1181,40 +1188,41 @@ async function loadHotMovers(type){
     return;
   }
 
-  el.innerHTML=`<div class="hot-loading">${type==='crypto'?'🪙':'📈'} Scanning for top movers...</div>`;
+  el.innerHTML=`<div class="hot-loading">${type==='crypto'?'🪙':'📈'} Finding top movers...</div>`;
 
   try{
     const candidates = type==='crypto' ? await fetchHotCrypto() : await fetchHotStocks();
-    console.log(`Hot ${type}: got ${candidates.length} candidates`);
-    const results=[];
 
-    for(const c of candidates.slice(0,35)){
-      if(results.length>=8) break;
-      try{
+    // Step 1: pre-screen without any extra fetch — skip obvious losers
+    const strong = candidates.filter(c=>quickScreen(c.chgPct)==='STRONG');
+    const watches = candidates.filter(c=>quickScreen(c.chgPct)==='WATCH');
+    const pool = [...strong, ...watches].slice(0, 16);
+
+    // Step 2: fetch candles in parallel batches of 4
+    const BATCH = 4;
+    const results = [];
+
+    for(let i=0; i<pool.length && results.length<8; i+=BATCH){
+      const batch = pool.slice(i, i+BATCH);
+      const settled = await Promise.allSettled(batch.map(async c=>{
         if(type==='crypto'&&c.cgId) cgIdMap[c.symbol]=c.cgId;
         const data = type==='crypto' ? await fetchCrypto(c.symbol) : await fetchStock(c.symbol);
-
-        // FIX: always recompute signal fresh for hot movers — bypass cache
         const cacheKey=(type==='crypto'?'C_':'')+c.symbol;
         delete signalCache[cacheKey];
         const sig = computeSignal(c.symbol, data, type==='crypto');
-
         const chgV=(data.price-data.prevClose)/data.prevClose*100;
-
-        // FIX: include BUY and WAIT — only skip SELL signals
-        // This ensures we always show something even in bearish markets
-        if(sig.signal!=='SELL'){
-          const info = type==='crypto'
-            ? (CRYPTO[c.symbol]||{emoji:'🪙',name:c.name||c.symbol})
-            : (STOCKS[c.symbol]||{emoji:'📈',name:c.name||c.symbol});
-          results.push({ticker:c.symbol, name:info.name, emoji:info.emoji,
-                        price:data.price, chgV, sig, type});
-        }
-      }catch(e){ console.warn('Hot mover skip:',c.symbol,e.message); }
-      await new Promise(r=>setTimeout(r,200));
+        const info = type==='crypto'
+          ? (CRYPTO[c.symbol]||{emoji:'🪙',name:c.name||c.symbol})
+          : (STOCKS[c.symbol]||{emoji:'📈',name:c.name||c.symbol});
+        return {ticker:c.symbol, name:info.name, emoji:info.emoji, price:data.price, chgV, sig, type};
+      }));
+      for(const s of settled){
+        if(s.status==='fulfilled' && s.value.sig.signal!=='SELL') results.push(s.value);
+      }
+      // tiny yield between batches to keep UI responsive
+      if(results.length<8 && i+BATCH<pool.length) await new Promise(r=>setTimeout(r,30));
     }
 
-    console.log(`Hot ${type}: ${results.length} results after filtering`);
     hotCache[type] = { results, ts: Date.now() };
     if(!document.getElementById(elId)) return;
     renderHotCards(document.getElementById(elId), results, type);
@@ -1223,7 +1231,7 @@ async function loadHotMovers(type){
 
   }catch(e){
     console.error('Hot movers error:',e);
-    if(el) el.innerHTML=`<div class="hot-empty">Couldn't load right now — tap ↻ refresh to try again</div>`;
+    if(el) el.innerHTML=`<div class="hot-empty">Couldn't load right now — tap ↻ to retry</div>`;
   }
 }
 
@@ -1386,26 +1394,37 @@ async function loadModeBg(){
   if(loadingBg)return; loadingBg=true;
   const isC=state.assetMode==='crypto';
   const tickers=Object.keys(isC?CRYPTO:STOCKS).filter(t=>!(isC?cryptoCache:stockCache)[t]);
-  for(const t of tickers){
-    try{
-      const data=isC?await fetchCrypto(t):await fetchStock(t);
-      computeSignal(t,data,isC);
-      if(state.view==='markets'&&state.assetMode===(isC?'crypto':'stocks')){
-        document.querySelectorAll('.stock-card').forEach(card=>{
-          if(card.getAttribute('onclick')?.includes(`'${t}'`)){
-            const cache=isC?cryptoCache[t]:stockCache[t];
-            const chgV=(cache.price-cache.prevClose)/cache.prevClose*100;
-            card.querySelector('.sc-price').textContent='$'+(isC?fmtCryptoPrice(cache.price):fmt(cache.price));
-            card.querySelector('.sc-chg').innerHTML=`<span class="${cc(chgV)}">${pct(chgV)}</span>`;
-            const se=card.querySelector('.sc-sig');
-            const sig=signalCache[(isC?'C_':'')+t];
-            if(se&&sig){se.textContent=sig.signal;se.className=`sc-sig ${sig.signal}`;}
-            checkAlerts(t,cache.price);
-          }
-        });
+
+  function updateCard(t){
+    if(state.view!=='markets') return;
+    const cache=isC?cryptoCache[t]:stockCache[t];
+    if(!cache) return;
+    const chgV=(cache.price-cache.prevClose)/cache.prevClose*100;
+    document.querySelectorAll('.stock-card').forEach(card=>{
+      if(card.getAttribute('onclick')?.includes(`'${t}'`)){
+        card.querySelector('.sc-price').textContent='$'+(isC?fmtCryptoPrice(cache.price):fmt(cache.price));
+        card.querySelector('.sc-chg').innerHTML=`<span class="${cc(chgV)}">${pct(chgV)}</span>`;
+        const se=card.querySelector('.sc-sig');
+        const sig=signalCache[(isC?'C_':'')+t];
+        if(se&&sig){se.textContent=sig.signal;se.className=`sc-sig ${sig.signal}`;}
+        checkAlerts(t,cache.price);
       }
-    }catch(e){console.warn('Failed:',t,e.message);}
-    await new Promise(r=>setTimeout(r,300));
+    });
+  }
+
+  // Fetch in parallel batches of 4 — much faster than sequential
+  const BATCH=4;
+  for(let i=0; i<tickers.length; i+=BATCH){
+    const batch=tickers.slice(i,i+BATCH);
+    await Promise.allSettled(batch.map(async t=>{
+      try{
+        const data=isC?await fetchCrypto(t):await fetchStock(t);
+        computeSignal(t,data,isC);
+        updateCard(t);
+      }catch(e){console.warn('BG load failed:',t,e.message);}
+    }));
+    // small yield between batches so UI stays smooth
+    await new Promise(r=>setTimeout(r,20));
   }
   loadingBg=false; updateSignalOutcomes();
 }
