@@ -124,6 +124,7 @@ html,body{background:var(--bg);font-family:'Nunito',sans-serif;color:var(--text)
 .hot-card-sig{font-size:11px;padding:2px 8px;border-radius:8px;margin-top:4px;display:inline-block;background:rgba(0,232,122,.15);color:var(--green);border:1px solid rgba(0,232,122,.3);}
 .hot-card-sig.hot-card-sig-crypto{background:rgba(255,179,64,.15);color:var(--amber);border-color:rgba(255,179,64,.3);}
 .hot-card-sig.hot-card-sig-wait{background:rgba(255,179,64,.12);color:var(--amber);border-color:rgba(255,179,64,.25);}
+.hot-card-sig.hot-card-sig-bounce{background:rgba(163,139,250,.15);color:var(--purple);border:1px solid rgba(163,139,250,.3);}
 .hot-loading{font-size:13px;color:var(--dim);padding:18px;text-align:center;width:100%;}
 .hot-empty{font-size:13px;color:var(--dim);padding:10px 4px;}
 .hot-divider{margin:0 12px 4px;height:1px;background:var(--border);}
@@ -1125,18 +1126,35 @@ function hotCacheAge(type){
 }
 
 async function fetchHotStocks(){
+  // Try Yahoo screener with short timeout — if slow, move on fast
   try{
     const url='https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved?formatted=false&lang=en-US&region=US&scrIds=day_gainers&count=35&start=0';
-    const d=await fetchWithProxy(url);
+    const d=await fetchWithProxy(url, 6000); // short 6s timeout
     const quotes=(d?.finance?.result?.[0]?.quotes||[]).slice(0,35);
     if(quotes.length>0) return quotes.map(q=>({symbol:q.symbol,name:q.shortName||q.longName||q.symbol,chgPct:q.regularMarketChangePercent||0}));
   }catch(e){console.warn('Gainers failed:',e.message);}
-  // Fallback: trending
+
+  // Fallback 1: Yahoo most active (different endpoint, often faster)
   try{
-    const d2=await fetchWithProxy('https://query1.finance.yahoo.com/v2/finance/trending/US?count=35');
+    const d2=await fetchWithProxy('https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved?formatted=false&lang=en-US&region=US&scrIds=most_actives&count=35&start=0', 6000);
     const quotes=(d2?.finance?.result?.[0]?.quotes||[]).slice(0,35);
+    if(quotes.length>0) return quotes.map(q=>({symbol:q.symbol,name:q.shortName||q.symbol,chgPct:q.regularMarketChangePercent||0})).filter(q=>q.chgPct>0);
+  }catch(e){console.warn('Most actives failed:',e.message);}
+
+  // Fallback 2: Yahoo trending (almost always works)
+  try{
+    const d3=await fetchWithProxy('https://query1.finance.yahoo.com/v2/finance/trending/US?count=35', 6000);
+    const quotes=(d3?.finance?.result?.[0]?.quotes||[]).slice(0,35);
     if(quotes.length>0) return quotes.map(q=>({symbol:q.symbol,name:q.symbol,chgPct:0}));
   }catch(e){console.warn('Trending failed:',e.message);}
+
+  // Fallback 3: Use stocks already in our cache — pick the ones up today
+  const cached=Object.entries(stockCache).map(([t,d])=>{
+    const chg=((d.price-d.prevClose)/d.prevClose)*100;
+    return {symbol:t,name:STOCKS[t]?.name||t,chgPct:chg};
+  }).filter(s=>s.chgPct>0).sort((a,b)=>b.chgPct-a.chgPct);
+  if(cached.length>0){console.log('Using cache fallback for hot stocks');return cached;}
+
   return [];
 }
 
@@ -1267,17 +1285,21 @@ function renderHotCards(el, results, type){
   if(!el) return;
   const isC = type==='crypto';
   if(!results||results.length===0){
-    el.innerHTML=`<div class="hot-empty">${isC?'No top movers found — tap ↻ refresh or check back later':'No top movers found — tap ↻ refresh or check individual stocks'}</div>`;
+    el.innerHTML=`<div class="hot-empty">${isC?'No top movers found — tap ↻ refresh or check back later':'No top movers found — tap ↻ refresh'}</div>`;
     return;
   }
   el.innerHTML = results.map(r=>{
     const isBuy = r.sig.signal==='BUY';
-    const sigCls = isBuy ? (isC?'hot-card-sig-crypto':'') : 'hot-card-sig-wait';
-    // mini confidence dots — show how close to BUY
-    const dotCls = isBuy ? (isC?'var(--amber)':'var(--green)') : 'var(--dim)';
+    // BOUNCE = oversold+up today = potential reversal, highlight differently
+    const isBounce = isC && !isBuy && r.sig.rsiVal<45 && r.chgV>2;
+    const label = isBounce ? 'BOUNCE?' : r.sig.signal;
+    const sigCls = isBuy ? (isC?'hot-card-sig-crypto':'')
+                 : isBounce ? 'hot-card-sig-bounce'
+                 : 'hot-card-sig-wait';
     const filledDots = r.sig.bulls;
+    const dotColor = isBuy?(isC?'var(--amber)':'var(--green)'):isBounce?'var(--amber)':'var(--dim)';
     const dots = Array.from({length:5},(_,i)=>
-      `<span style="display:inline-block;width:5px;height:5px;border-radius:50%;margin:0 1px;background:${i<filledDots?(isBuy?(isC?'var(--amber)':'var(--green)'):'var(--amber)'):'var(--border)'};"></span>`
+      `<span style="display:inline-block;width:5px;height:5px;border-radius:50%;margin:0 1px;background:${i<filledDots?dotColor:'var(--border)'};"></span>`
     ).join('');
     return`<div class="hot-card ${isC?'hot-card-crypto':''}" onclick="showView('detail','${r.ticker}','${type}')">
       <div class="hot-card-emoji">${r.emoji}</div>
@@ -1285,13 +1307,12 @@ function renderHotCards(el, results, type){
       <div class="hot-card-name">${r.name}</div>
       <div class="hot-card-chg ${cc(r.chgV)}">${r.chgV>=0?'+':''}${r.chgV.toFixed(2)}%</div>
       <div style="display:flex;align-items:center;justify-content:space-between;margin-top:5px;">
-        <div class="hot-card-sig ${sigCls}">${r.sig.signal}</div>
+        <div class="hot-card-sig ${sigCls}">${label}</div>
         <div style="line-height:1;">${dots}</div>
       </div>
     </div>`;
   }).join('');
 }
-
 function forceRefreshHot(type){
   hotCache[type]=null;
   loadHotMovers(type);
@@ -1528,8 +1549,26 @@ async function renderDetail(ticker,type){
       <div class="wi-plain">${v.plain}</div><div class="wi-trans">${v.trans}</div></div>`).join('');
     let holdBanner='';
     if(hold){
-      const curV=data.price*hold.shares,cost=hold.avgPrice*hold.shares,pnlA=curV-cost,pnlP=(pnlA/cost)*100;
-      holdBanner=`<div class="hold-banner">You own <strong style="color:var(--bright);">${fmtShares(hold.shares,type)} ${ticker}</strong> · avg $${isC?fmtCryptoPrice(hold.avgPrice):fmt(hold.avgPrice)} &nbsp;·&nbsp; <strong class="${cc(pnlA)}">${pnlA>=0?'+':''}$${fmtD(Math.abs(pnlA))} (${pct(pnlP)})</strong></div>`;
+      const curV=data.price*hold.shares, cost=hold.avgPrice*hold.shares;
+      const pnlA=curV-cost, pnlP=(pnlA/cost)*100;
+      const sellWarning = sig.signal==='SELL'
+        ? `<div style="margin-top:7px;font-size:12px;color:var(--red);font-weight:700;">⚠️ Signal says SELL — consider locking in ${pnlA>=0?'your profit':'to limit losses'}</div>`
+        : sig.signal==='BUY' && pnlA<0
+        ? `<div style="margin-top:7px;font-size:12px;color:var(--amber);">📈 Signal still bullish — could average down or hold</div>`
+        : '';
+      holdBanner=`<div class="hold-banner" style="cursor:pointer" onclick="openTrade('${ticker}','${type}')">
+        <div style="display:flex;justify-content:space-between;align-items:center;">
+          <div>
+            <div style="font-size:11px;color:var(--text);margin-bottom:2px;">YOUR POSITION</div>
+            <div style="font-size:13px;color:var(--bright);font-weight:700;">${fmtShares(hold.shares,type)} ${ticker} · avg $${isC?fmtCryptoPrice(hold.avgPrice):fmt(hold.avgPrice)}</div>
+          </div>
+          <div style="text-align:right;">
+            <div style="font-family:'Share Tech Mono',monospace;font-size:14px;font-weight:700;" class="${cc(pnlA)}">${pnlA>=0?'+':''}$${fmtD(Math.abs(pnlA))}</div>
+            <div style="font-size:11px;" class="${cc(pnlA)}">${pct(pnlP)}</div>
+          </div>
+        </div>
+        ${sellWarning}
+      </div>`;
     }
     let chartHtml='', indicatorsHtml='';
     // Chart always shows — simple AND deep mode
@@ -1916,13 +1955,21 @@ function renderPortfolio(){
       const price=cache?.price||h.avgPrice;
       const curV=price*h.shares,cost=h.avgPrice*h.shares,pnlA=curV-cost,pnlP=(pnlA/cost)*100;
       const s=(isC?CRYPTO:STOCKS)[t]||{emoji:isC?'🪙':'📈'};
-      return`<div class="hold-card" onclick="showView('detail','${t}','${type}')">
+      const sig=signalCache[(isC?'C_':'')+t];
+      const sigBadge=sig?`<span class="sc-sig ${sig.signal}" style="font-size:10px;">${sig.signal}</span>`:'';
+      const sellWarn=sig?.signal==='SELL'
+        ?`<div style="margin-top:7px;padding:6px 8px;background:rgba(255,68,102,.1);border-radius:6px;font-size:11px;color:var(--red);font-weight:700;">⚠️ Sell signal — tap for details</div>`:
+        sig?.signal==='BUY'&&pnlA<0
+        ?`<div style="margin-top:7px;padding:6px 8px;background:rgba(0,232,122,.08);border-radius:6px;font-size:11px;color:var(--green);">📈 Still bullish — could hold or add more</div>`:
+        '';
+      const cardBorder=sig?.signal==='SELL'?'border:1px solid rgba(255,68,102,.35);':'';
+      return`<div class="hold-card" style="${cardBorder}" onclick="showView('detail','${t}','${type}')">
         <div class="hold-top">
-          <div><div class="hold-ticker">${s.emoji} ${t}</div>
+          <div><div class="hold-ticker">${s.emoji} ${t} ${sigBadge}</div>
           <div class="hold-shares">${fmtShares(h.shares,type)} ${isC?t:'shares'} · avg $${isC?fmtCryptoPrice(h.avgPrice):fmt(h.avgPrice)}</div></div>
           <div><div class="hold-val">$${fmtD(curV)}</div>
           <div class="hold-pnl ${cc(pnlA)}">${pnlA>=0?'+':''}$${fmtD(Math.abs(pnlA))} (${pct(pnlP)})</div></div>
-        </div></div>`;
+        </div>${sellWarn}</div>`;
     }).join('');
 
   const allAlerts=(p.alerts||[]).filter(a=>!a.triggered);
@@ -2009,30 +2056,123 @@ function renderStats(){
       </div></div>`;
   }).join('');
 
+  // Unrealized gains from open positions
+  const unrealizedPnl = Object.entries(p.holdings).reduce((s,[t,h])=>{
+    const cache=h.type==='crypto'?cryptoCache[t]:stockCache[t];
+    const price=cache?.price||h.avgPrice;
+    return s+(price-h.avgPrice)*h.shares;
+  },0);
+
+  // Open position sell recommendations
+  const sellRecs = Object.entries(p.holdings).map(([t,h])=>{
+    const sig=signalCache[(h.type==='crypto'?'C_':'')+t];
+    const cache=h.type==='crypto'?cryptoCache[t]:stockCache[t];
+    if(!sig||!cache) return null;
+    const curV=cache.price*h.shares, cost=h.avgPrice*h.shares, pnlA=curV-cost, pnlP=(pnlA/cost)*100;
+    return {ticker:t,type:h.type,signal:sig.signal,pnlA,pnlP,curV,sig};
+  }).filter(r=>r&&r.signal==='SELL');
+
   c.innerHTML=`
     <div class="stats-card">
       <div class="sc-hdr"><div class="sc-emoji">${pCfg?.emoji}</div>
         <div><div class="sc-pname">${pCfg?.name}'s Portfolio</div><div class="sc-psub">Phillips Family Stack Tracker</div></div></div>
       <div class="sc-total">$${fmtD(total)}</div>
-      <div class="sc-ret ${cc(diff)}">${diff>=0?'+':''}$${fmtD(Math.abs(diff))} · ${pct(ret)} return</div>
-      <div class="sc-grid">
-        <div class="sc-item"><div class="sc-item-lbl">TOTAL TRADES</div><div class="sc-item-val">${trades.length}</div><div class="sc-item-sub">${stockTrades.length} stocks · ${cryptoTrades.length} crypto</div></div>
-        <div class="sc-item"><div class="sc-item-lbl">WIN RATE</div><div class="sc-item-val">${sells.length?wr+'%':'—'}</div><div class="sc-item-sub">${wins.length}/${sells.length} closed trades</div></div>
-        <div class="sc-item"><div class="sc-item-lbl">BEST CALL</div><div class="sc-item-val green">${best?best.ticker:'—'}</div><div class="sc-item-sub">${best?'+$'+fmtD(best.pnl):'make some trades!'}</div></div>
-        <div class="sc-item"><div class="sc-item-lbl">SIGNAL ACC.</div><div class="sc-item-val">${accRate!=null?accRate+'%':'—'}</div><div class="sc-item-sub">${scored.length} signals scored</div></div>
+      <div class="sc-ret ${cc(diff)}">${diff>=0?'+':''}$${fmtD(Math.abs(diff))} · ${pct(ret)} total return</div>
+      <div style="display:flex;gap:8px;margin-bottom:12px;">
+        <div style="flex:1;background:rgba(255,255,255,.04);border-radius:10px;padding:8px 10px;font-size:11px;">
+          <div style="color:var(--text);margin-bottom:2px;">Closed trades</div>
+          <div style="color:${sells.length?'var(--bright)':'var(--dim)'};font-weight:700;">${sells.reduce((s,t)=>s+(t.pnl||0),0)>=0?'+':''}$${fmtD(Math.abs(sells.reduce((s,t)=>s+(t.pnl||0),0)))}</div>
+        </div>
+        <div style="flex:1;background:rgba(255,255,255,.04);border-radius:10px;padding:8px 10px;font-size:11px;">
+          <div style="color:var(--text);margin-bottom:2px;">Unrealized</div>
+          <div style="color:${unrealizedPnl>=0?'var(--green)':'var(--red)'};font-weight:700;">${unrealizedPnl>=0?'+':''}$${fmtD(Math.abs(unrealizedPnl))}</div>
+        </div>
       </div>
+      <div class="sc-grid">
+        <div class="sc-item"><div class="sc-item-lbl">TRADES MADE</div><div class="sc-item-val">${trades.length}</div><div class="sc-item-sub">${stockTrades.length} stocks · ${cryptoTrades.length} crypto</div></div>
+        <div class="sc-item"><div class="sc-item-lbl">WIN RATE</div>
+          <div class="sc-item-val">${sells.length?wr+'%':'—'}</div>
+          <div class="sc-item-sub">${sells.length?wins.length+'/'+sells.length+' CLOSED only':'sell a position to track'}</div></div>
+        <div class="sc-item" style="cursor:${best?'pointer':'default'};" onclick="${best?`showTradeDetail('${best.ticker}','${best.type||'stock'}','${best.date}')`:''}">\
+<div class="sc-item-lbl">BEST CALL ${best?'👆':''}</div>\
+<div class="sc-item-val green">${best?best.ticker:'—'}</div>\
+<div class="sc-item-sub">${best?'+$'+fmtD(best.pnl)+' · tap for detail':'make some trades!'}</div></div>
+        <div class="sc-item"><div class="sc-item-lbl">SIGNAL ACC.</div><div class="sc-item-val">${accRate!=null?accRate+'%':'—'}</div><div class="sc-item-sub">${scored.length?scored.length+' signals scored':'views signals to track'}</div></div>
+      </div>
+      ${sellRecs.length?`<div style="background:rgba(255,68,102,.08);border:1px solid rgba(255,68,102,.25);border-radius:10px;padding:11px 13px;margin-top:10px;">
+        <div style="font-size:11px;color:var(--red);font-weight:800;margin-bottom:6px;">⚠️ Sell signals on your holdings</div>
+        ${sellRecs.map(r=>`<div style="display:flex;justify-content:space-between;padding:5px 0;border-bottom:1px solid rgba(255,68,102,.15);font-size:12px;" onclick="showView('detail','${r.ticker}','${r.type}')" style="cursor:pointer;">
+          <span style="color:var(--bright);font-weight:700;">${r.ticker}</span>
+          <span class="${cc(r.pnlA)}">${r.pnlA>=0?'+':''}$${fmtD(Math.abs(r.pnlA))} (${pct(r.pnlP)})</span>
+          <span style="color:var(--red);">SELL →</span>
+        </div>`).join('')}
+      </div>`:''}
       <button class="share-card-btn" onclick="showShareCard()">📊 Show My Stats Card</button>
     </div>
     <div class="sec-hdr">SIGNAL ACCURACY LOG 📝</div>
     <div style="margin:0 12px 16px;background:var(--surface);border-radius:12px;border:1px solid var(--border);overflow:hidden;">
-      ${accRows||'<div class="empty" style="padding:13px;"><div class="empty-text">Signals get scored after 7 days. Start browsing stocks and crypto to build your accuracy history!</div></div>'}
+      ${accRows||'<div class="empty" style="padding:13px;"><div class="empty-text">Signal accuracy scores after 7 days. Browse stocks and crypto to start tracking!</div></div>'}
     </div>`;
 }
 
 // ═══════════════════════════════════════════════════════════════════
 // SHARE CARD
 // ═══════════════════════════════════════════════════════════════════
-function showShareCard(){
+function showTradeDetail(ticker, type, date){
+  if(!ticker) return;
+  // Find the trade
+  const trade = state.profile.tradeHistory.find(t=>
+    t.ticker===ticker && t.action==='sell' && t.date===date
+  ) || state.profile.tradeHistory.find(t=>t.ticker===ticker && t.action==='sell');
+  if(!trade) return showView('detail', ticker, type);
+
+  const isC=type==='crypto';
+  const s=(isC?CRYPTO:STOCKS)[ticker]||{emoji:'📈',name:ticker};
+  const sig=signalCache[(isC?'C_':'')+ticker];
+  const buyTrade=state.profile.tradeHistory.find(t=>t.ticker===ticker&&t.action==='buy');
+  const pnlPct=((trade.pnl||0)/(trade.total-trade.pnl||1))*100;
+  const held=buyTrade&&trade?
+    Math.round((new Date(trade.date)-new Date(buyTrade.date))/(1000*60*60*24))+' days':
+    'unknown';
+
+  const modal=document.getElementById('learnModal');
+  const content=document.getElementById('learnContent');
+  content.innerHTML=`
+    <div style="text-align:center;margin-bottom:16px;">
+      <div style="font-size:32px;">${s.emoji}</div>
+      <div style="font-family:'Orbitron',sans-serif;font-size:18px;font-weight:700;color:var(--bright);margin-top:6px;">${ticker}</div>
+      <div style="font-size:13px;color:var(--text);">${s.name}</div>
+    </div>
+    <div style="background:rgba(0,232,122,.08);border:1px solid rgba(0,232,122,.2);border-radius:12px;padding:14px;margin-bottom:14px;text-align:center;">
+      <div style="font-size:11px;color:var(--text);margin-bottom:4px;">PROFIT ON THIS TRADE</div>
+      <div style="font-family:'Orbitron',sans-serif;font-size:28px;font-weight:700;color:var(--green);">+$${fmtD(trade.pnl||0)}</div>
+      <div style="font-size:13px;color:var(--green);">+${pnlPct.toFixed(2)}% · held ${held}</div>
+    </div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:14px;">
+      <div style="background:var(--surface2);border-radius:10px;padding:10px;">
+        <div style="font-size:10px;color:var(--text);margin-bottom:3px;">BOUGHT AT</div>
+        <div style="font-family:'Share Tech Mono',monospace;font-size:14px;color:var(--bright);">$${fmt(buyTrade?.price||0)}</div>
+        <div style="font-size:10px;color:var(--dim);">${buyTrade?new Date(buyTrade.date).toLocaleDateString():''}</div>
+      </div>
+      <div style="background:var(--surface2);border-radius:10px;padding:10px;">
+        <div style="font-size:10px;color:var(--text);margin-bottom:3px;">SOLD AT</div>
+        <div style="font-family:'Share Tech Mono',monospace;font-size:14px;color:var(--bright);">$${fmt(trade.price||0)}</div>
+        <div style="font-size:10px;color:var(--dim);">${new Date(trade.date).toLocaleDateString()}</div>
+      </div>
+    </div>
+    <div style="background:var(--surface);border-radius:10px;padding:12px;margin-bottom:14px;font-size:13px;color:var(--text);line-height:1.6;">
+      💡 <strong style="color:var(--bright);">Why this worked:</strong> You bought ${ticker} at $${fmt(buyTrade?.price||0)} and sold at $${fmt(trade.price||0)}, 
+      locking in a $${fmtD(trade.pnl||0)} profit. 
+      ${pnlPct>5?`That's a ${pnlPct.toFixed(1)}% gain — solid trade!`:`Small gain, but a win is a win!`}
+      ${held!=='unknown'?` You held it for ${held}.`:''}
+    </div>
+    <button onclick="closeModal('learnModal');showView('detail','${ticker}','${type}')" style="width:100%;padding:13px;border-radius:10px;background:var(--blue);color:#fff;font-size:14px;font-weight:700;border:none;cursor:pointer;">
+      See Current Signal for ${ticker} →
+    </button>`;
+  openModal('learnModal');
+}
+
+
   const p=state.profile,pCfg=PCFG.find(x=>x.id===state.profileId);
   const lv=Object.entries(p.holdings).reduce((s,[t,h])=>{const cache=h.type==='crypto'?cryptoCache[t]:stockCache[t];return s+(cache?.price||h.avgPrice)*h.shares;},0);
   const total=p.cash+lv,diff=total-1000000,ret=(diff/1000000)*100;
