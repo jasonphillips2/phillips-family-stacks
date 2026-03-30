@@ -50,6 +50,19 @@ html,body{background:var(--bg);font-family:'Nunito',sans-serif;color:var(--text)
 .ms-desc{font-size:clamp(12px,3.2vw,14px);color:var(--text);line-height:1.5;}
 .ms-footer{font-size:clamp(11px,2.8vw,13px);color:var(--dim);margin-top:20px;line-height:1.6;}
 
+/* PORTFOLIO SNAPSHOT on mode select */
+.ms-snapshot{width:100%;max-width:320px;background:var(--surface);border:1px solid var(--border);border-radius:16px;padding:16px;margin-bottom:20px;text-align:left;position:relative;overflow:hidden;}
+.ms-snapshot::before{content:'';position:absolute;top:0;left:0;right:0;height:2px;background:linear-gradient(90deg,var(--blue),var(--green));}
+.ms-snap-total-lbl{font-size:clamp(9px,2.3vw,11px);color:var(--text);letter-spacing:2px;font-family:'Share Tech Mono',monospace;margin-bottom:3px;}
+.ms-snap-total{font-family:'Orbitron',sans-serif;font-size:clamp(22px,6vw,28px);font-weight:700;color:var(--bright);margin-bottom:2px;}
+.ms-snap-pnl{font-size:clamp(12px,3.2vw,14px);font-weight:700;margin-bottom:14px;}
+.ms-snap-rows{display:flex;flex-direction:column;gap:6px;}
+.ms-snap-row{display:flex;justify-content:space-between;align-items:center;padding:7px 10px;background:rgba(255,255,255,.03);border-radius:8px;}
+.ms-snap-row-lbl{font-size:clamp(11px,3vw,13px);color:var(--text);display:flex;align-items:center;gap:6px;}
+.ms-snap-row-val{font-family:'Share Tech Mono',monospace;font-size:clamp(12px,3.2vw,14px);font-weight:700;color:var(--bright);}
+.ms-snap-bar{height:4px;background:var(--border);border-radius:2px;overflow:hidden;margin-top:10px;}
+.ms-snap-bar-fill{height:100%;border-radius:2px;background:linear-gradient(90deg,var(--blue),var(--green));transition:width .5s;}
+
 /* APP SHELL */
 #screen-app{display:flex;flex-direction:column;min-height:100vh;}
 .app-header{border-bottom:1px solid var(--border);background:rgba(13,15,20,.97);backdrop-filter:blur(8px);position:sticky;top:0;z-index:40;}
@@ -341,7 +354,7 @@ canvas{width:100%;display:block;border-radius:8px;background:var(--surface);}
 </head>
 <body>
 
-<div id="loader"><div class="ld-title">STACK TRACKER</div><div class="ld-sub">PHILLIPS FAMILY</div><div class="ld-bar"><div class="ld-fill" id="ldFill"></div></div></div>
+<div id="loader"><div class="ld-title">PHILLIPS STACK TRACKER</div><div class="ld-sub">LOADING YOUR PORTFOLIO</div><div class="ld-bar"><div class="ld-fill" id="ldFill"></div></div></div>
 
 <div id="screen-profile">
   <div class="ps-logo">STACK<span>TRACKER</span></div>
@@ -354,7 +367,30 @@ canvas{width:100%;display:block;border-radius:8px;background:var(--surface);}
 <div id="screen-mode" class="hidden">
   <div class="ms-greeting" id="msGreeting">HEY JASON</div>
   <div class="ms-heading">What are we trading today?</div>
-  <div class="ms-sub">Both use your same $1,000,000 portfolio.<br>You can switch anytime from inside the app.</div>
+
+  <!-- Portfolio snapshot — populated by showModeSelect() -->
+  <div class="ms-snapshot" id="msSnapshot">
+    <div class="ms-snap-total-lbl">YOUR PORTFOLIO</div>
+    <div class="ms-snap-total" id="msTotal">$1,000,000</div>
+    <div class="ms-snap-pnl" id="msPnl" style="color:var(--dim);">Loading...</div>
+    <div class="ms-snap-rows">
+      <div class="ms-snap-row">
+        <span class="ms-snap-row-lbl">💵 Cash</span>
+        <span class="ms-snap-row-val" id="msCash">—</span>
+      </div>
+      <div class="ms-snap-row">
+        <span class="ms-snap-row-lbl">📈 Stocks</span>
+        <span class="ms-snap-row-val" id="msStocks">—</span>
+      </div>
+      <div class="ms-snap-row">
+        <span class="ms-snap-row-lbl">₿ Crypto</span>
+        <span class="ms-snap-row-val" id="msCrypto">—</span>
+      </div>
+    </div>
+    <div class="ms-snap-bar"><div class="ms-snap-bar-fill" id="msBar" style="width:0%"></div></div>
+  </div>
+
+  <div class="ms-sub" style="margin-bottom:16px;">Stocks and crypto share the same portfolio.<br>Switch anytime with the tabs at the bottom.</div>
   <div class="ms-cards">
     <div class="ms-card stocks" onclick="selectMode('stocks')">
       <div class="ms-icon">📈</div>
@@ -367,7 +403,7 @@ canvas{width:100%;display:block;border-radius:8px;background:var(--surface);}
       <div class="ms-desc">Bitcoin, Ethereum, Solana, Dogecoin and more. Markets open 24/7 — never sleeps.</div>
     </div>
   </div>
-  <div class="ms-footer">💡 Markets are closed? Try crypto — it trades around the clock.</div>
+  <div class="ms-footer">💡 Markets closed? Crypto trades 24/7 — Jackson's favourite.</div>
 </div>
 
 <div id="screen-app" class="hidden">
@@ -977,6 +1013,31 @@ function showModeSelect(){
   const cfg=PCFG.find(p=>p.id===state.profileId);
   document.getElementById('msGreeting').textContent=`HEY ${cfg?.name?.toUpperCase()||''}! 👋`;
   document.getElementById('screen-mode').classList.remove('hidden');
+
+  // Populate portfolio snapshot using cached prices where available
+  const p=state.profile;
+  let stockVal=0, cryptoVal=0;
+  Object.entries(p.holdings||{}).forEach(([t,h])=>{
+    const isC=h.type==='crypto';
+    const cache=isC?cryptoCache[t]:stockCache[t];
+    const price=cache?.price||h.avgPrice;
+    if(isC) cryptoVal+=price*h.shares;
+    else stockVal+=price*h.shares;
+  });
+  const total=p.cash+stockVal+cryptoVal;
+  const diff=total-1000000;
+  const ret=(diff/1000000)*100;
+  const invested=stockVal+cryptoVal;
+  const investedPct=total>0?Math.min(100,(invested/total)*100):0;
+
+  document.getElementById('msTotal').textContent='$'+fmtD(total);
+  const pnlEl=document.getElementById('msPnl');
+  pnlEl.textContent=(diff>=0?'+':'')+'$'+fmtD(Math.abs(diff))+' ('+pct(ret)+') overall';
+  pnlEl.style.color=diff>=0?'var(--green)':diff<0?'var(--red)':'var(--dim)';
+  document.getElementById('msCash').textContent='$'+fmtD(p.cash);
+  document.getElementById('msStocks').textContent=stockVal>0?'$'+fmtD(stockVal):'—';
+  document.getElementById('msCrypto').textContent=cryptoVal>0?'$'+fmtD(cryptoVal):'—';
+  document.getElementById('msBar').style.width=investedPct.toFixed(1)+'%';
 }
 
 function selectMode(mode){
