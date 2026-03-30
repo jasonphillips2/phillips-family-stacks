@@ -625,73 +625,170 @@ function liveVal(profile){
 // ═══════════════════════════════════════════════════════════════════
 // DATA FETCHING
 // ═══════════════════════════════════════════════════════════════════
-async function fetchWithProxy(url,ms=10000){
-  const proxies=[u=>u,u=>`https://corsproxy.io/?${encodeURIComponent(u)}`,u=>`https://api.allorigins.win/get?url=${encodeURIComponent(u)}`];
+// ── CORS PROXY WATERFALL (5 options) ─────────────────────────────
+// Tries each proxy in turn — first success wins
+async function fetchWithProxy(url, ms=10000){
+  const proxies=[
+    u=>u,                                                               // 1. direct
+    u=>`https://corsproxy.io/?${encodeURIComponent(u)}`,               // 2. corsproxy.io
+    u=>`https://api.allorigins.win/get?url=${encodeURIComponent(u)}`,  // 3. allorigins
+    u=>`https://thingproxy.freeboard.io/fetch/${u}`,                   // 4. thingproxy
+    u=>`https://proxy.cors.sh/${u}`,                                    // 5. cors.sh
+  ];
   for(const proxy of proxies){
-    const ctrl=new AbortController(),t=setTimeout(()=>ctrl.abort(),ms);
-    try{const r=await fetch(proxy(url),{signal:ctrl.signal});clearTimeout(t);if(!r.ok)throw new Error('HTTP '+r.status);let d=await r.json();if(d&&d.contents)d=JSON.parse(d.contents);return d;}
-    catch(e){clearTimeout(t);console.warn(e.message);}
+    const ctrl=new AbortController(), t=setTimeout(()=>ctrl.abort(), ms);
+    try{
+      const r=await fetch(proxy(url),{signal:ctrl.signal});
+      clearTimeout(t);
+      if(!r.ok) throw new Error('HTTP '+r.status);
+      let d=await r.json();
+      if(d&&d.contents) d=JSON.parse(d.contents);
+      return d;
+    }catch(e){clearTimeout(t); console.warn('proxy failed:',e.message);}
   }
-  throw new Error('All proxies failed');
+  throw new Error('connection_failed');
 }
 
+// ── STOCK DATA ────────────────────────────────────────────────────
 async function fetchStock(ticker){
   if(stockCache[ticker])return stockCache[ticker];
   const url=`https://query1.finance.yahoo.com/v8/finance/chart/${ticker}?interval=1d&range=3mo`;
   const d=await fetchWithProxy(url);
-  const r=d.chart.result[0],q=r.indicators.quote[0];
+  const r=d.chart.result[0], q=r.indicators.quote[0];
   const candles=[];
-  for(let i=0;i<r.timestamp.length;i++){if(q.close[i]==null)continue;candles.push({t:r.timestamp[i]*1000,o:q.open[i]||q.close[i],h:q.high[i]||q.close[i],l:q.low[i]||q.close[i],c:q.close[i],v:q.volume[i]||0});}
+  for(let i=0;i<r.timestamp.length;i++){
+    if(q.close[i]==null)continue;
+    candles.push({t:r.timestamp[i]*1000,o:q.open[i]||q.close[i],h:q.high[i]||q.close[i],l:q.low[i]||q.close[i],c:q.close[i],v:q.volume[i]||0});
+  }
   const result={price:r.meta.regularMarketPrice,prevClose:r.meta.chartPreviousClose,candles};
   stockCache[ticker]=result; return result;
 }
+
+// ── CRYPTO DATA — 4 source waterfall ─────────────────────────────
+// Kraken symbol map (most reliable public crypto API)
+const KRAKEN_MAP={BTC:'XBTUSD',ETH:'ETHUSD',SOL:'SOLUSD',XRP:'XRPUSD',LTC:'LTCUSD',
+  DOGE:'XDGUSD',ADA:'ADAUSD',AVAX:'AVAXUSD',DOT:'DOTUSD',ATOM:'ATOMUSD',
+  MATIC:'MATICUSD',LINK:'LINKUSD',UNI:'UNIUSD',ARB:'ARBUSD',NEAR:'NEARUSD'};
+// Coinbase product map
+const COINBASE_MAP={BTC:'BTC-USD',ETH:'ETH-USD',SOL:'SOL-USD',XRP:'XRP-USD',LTC:'LTC-USD',
+  DOGE:'DOGE-USD',ADA:'ADA-USD',AVAX:'AVAX-USD',DOT:'DOT-USD',ATOM:'ATOM-USD',
+  MATIC:'MATIC-USD',LINK:'LINK-USD',UNI:'UNI-USD',NEAR:'NEAR-USD'};
 
 async function fetchCrypto(ticker){
   if(cryptoCache[ticker])return cryptoCache[ticker];
   const info=CRYPTO[ticker];
   const binSym=info?.binSym||(ticker+'USDT');
+  let result=null;
 
-  // Try Binance first (best OHLCV data)
-  try{
-    const rows=await fetchWithProxy(`https://api.binance.com/api/v3/klines?symbol=${binSym}&interval=1d&limit=90`);
-    const candles=rows.map(r=>({t:+r[0],o:+r[1],h:+r[2],l:+r[3],c:+r[4],v:+r[5]}));
-    const price=candles[candles.length-1].c, prevClose=candles[candles.length-2]?.c||price;
-    const result={price,prevClose,candles};
-    cryptoCache[ticker]=result; return result;
-  }catch(e){console.warn('Binance failed for',ticker);}
+  // ── Source 1: Binance ─────────────────────────────────────────
+  if(!result){
+    try{
+      const rows=await fetchWithProxy(`https://api.binance.com/api/v3/klines?symbol=${binSym}&interval=1d&limit=90`);
+      if(Array.isArray(rows)&&rows.length>1){
+        const candles=rows.map(r=>({t:+r[0],o:+r[1],h:+r[2],l:+r[3],c:+r[4],v:+r[5]}));
+        result={price:candles[candles.length-1].c, prevClose:candles[candles.length-2].c, candles};
+      }
+    }catch(e){console.warn('Binance failed:',e.message);}
+  }
 
-  // Fallback: CoinGecko
-  const cgId=info?.cgId||cgIdMap[ticker];
-  if(!cgId)throw new Error('No data source for '+ticker);
-  const ohlc=await fetchWithProxy(`https://api.coingecko.com/api/v3/coins/${cgId}/ohlc?vs_currency=usd&days=90`);
-  const candles=ohlc.map(r=>({t:r[0],o:r[1],h:r[2],l:r[3],c:r[4],v:0}));
-  const pd=await fetchWithProxy(`https://api.coingecko.com/api/v3/simple/price?ids=${cgId}&vs_currencies=usd`);
-  const price=pd[cgId]?.usd||candles[candles.length-1].c;
-  const prevClose=candles[candles.length-2]?.c||price;
-  const result={price,prevClose,candles};
+  // ── Source 2: Kraken ──────────────────────────────────────────
+  if(!result){
+    const kPair=KRAKEN_MAP[ticker];
+    if(kPair){
+      try{
+        const d=await fetchWithProxy(`https://api.kraken.com/0/public/OHLC?pair=${kPair}&interval=1440&count=90`);
+        if(!d.error?.length){
+          const key=Object.keys(d.result).find(k=>k!=='last');
+          const rows=d.result[key]; // [time,open,high,low,close,vwap,volume,count]
+          if(rows?.length>1){
+            const candles=rows.map(r=>({t:+r[0]*1000,o:+r[1],h:+r[2],l:+r[3],c:+r[4],v:+r[6]}));
+            result={price:candles[candles.length-1].c, prevClose:candles[candles.length-2].c, candles};
+          }
+        }
+      }catch(e){console.warn('Kraken failed:',e.message);}
+    }
+  }
+
+  // ── Source 3: Coinbase ────────────────────────────────────────
+  if(!result){
+    const cbProd=COINBASE_MAP[ticker];
+    if(cbProd){
+      try{
+        const rows=await fetchWithProxy(`https://api.exchange.coinbase.com/products/${cbProd}/candles?granularity=86400`);
+        if(Array.isArray(rows)&&rows.length>1){
+          // Coinbase returns [time, low, high, open, close, volume] newest first
+          const sorted=rows.slice().sort((a,b)=>a[0]-b[0]).slice(-90);
+          const candles=sorted.map(r=>({t:+r[0]*1000,o:+r[3],h:+r[2],l:+r[1],c:+r[4],v:+r[5]}));
+          result={price:candles[candles.length-1].c, prevClose:candles[candles.length-2].c, candles};
+        }
+      }catch(e){console.warn('Coinbase failed:',e.message);}
+    }
+  }
+
+  // ── Source 4: CoinGecko ───────────────────────────────────────
+  if(!result){
+    const cgId=info?.cgId||cgIdMap[ticker];
+    if(cgId){
+      try{
+        const [ohlc, pd]=await Promise.all([
+          fetchWithProxy(`https://api.coingecko.com/api/v3/coins/${cgId}/ohlc?vs_currency=usd&days=90`),
+          fetchWithProxy(`https://api.coingecko.com/api/v3/simple/price?ids=${cgId}&vs_currencies=usd`),
+        ]);
+        if(Array.isArray(ohlc)&&ohlc.length>1){
+          const candles=ohlc.map(r=>({t:r[0],o:r[1],h:r[2],l:r[3],c:r[4],v:0}));
+          const price=pd[cgId]?.usd||candles[candles.length-1].c;
+          result={price, prevClose:candles[candles.length-2]?.c||price, candles};
+        }
+      }catch(e){console.warn('CoinGecko failed:',e.message);}
+    }
+  }
+
+  if(!result) throw new Error('retry');
   cryptoCache[ticker]=result; return result;
 }
 
-// Separate chart fetch for crypto — keeps signal data (daily) clean
-// tf: '1m'=1 minute 50 bars, '1h'=1 hour 60 bars, '1d'=daily 60 bars
-const chartCache={}; // key: ticker+'_'+tf
+// ── CRYPTO CHART (separate fetch, same 4-source logic) ────────────
+const chartCache={};
 async function fetchCryptoChart(ticker, tf){
   const key=ticker+'_'+tf;
-  if(chartCache[key]&&(Date.now()-chartCache[key].ts)<55000)return chartCache[key].candles; // cache 55s for 1m
+  if(chartCache[key]&&(Date.now()-chartCache[key].ts)<55000) return chartCache[key].candles;
   const info=CRYPTO[ticker];
   const binSym=info?.binSym||(ticker+'USDT');
   const binInterval=tf==='1m'?'1m':tf==='1h'?'1h':'1d';
-  const limit=tf==='1m'?50:tf==='1h'?60:60;
+  const limit=tf==='1m'?50:60;
+
+  // Binance is best for short-interval charts
   try{
     const rows=await fetchWithProxy(`https://api.binance.com/api/v3/klines?symbol=${binSym}&interval=${binInterval}&limit=${limit}`);
-    const candles=rows.map(r=>({t:+r[0],o:+r[1],h:+r[2],l:+r[3],c:+r[4],v:+r[5]}));
-    chartCache[key]={candles,ts:Date.now()};
-    return candles;
-  }catch(e){
-    // Fallback to slicing daily candles from main cache
-    const daily=cryptoCache[ticker]?.candles||[];
-    return daily.slice(-limit);
+    if(Array.isArray(rows)&&rows.length){
+      const candles=rows.map(r=>({t:+r[0],o:+r[1],h:+r[2],l:+r[3],c:+r[4],v:+r[5]}));
+      chartCache[key]={candles,ts:Date.now()};
+      return candles;
+    }
+  }catch(e){console.warn('Chart Binance failed:',e.message);}
+
+  // Kraken fallback for 1h/1d charts
+  if(tf!=='1m'){
+    const kPair=KRAKEN_MAP[ticker];
+    const kInterval=tf==='1h'?60:1440;
+    if(kPair){
+      try{
+        const d=await fetchWithProxy(`https://api.kraken.com/0/public/OHLC?pair=${kPair}&interval=${kInterval}&count=${limit}`);
+        if(!d.error?.length){
+          const k=Object.keys(d.result).find(x=>x!=='last');
+          const rows=d.result[k];
+          if(rows?.length){
+            const candles=rows.map(r=>({t:+r[0]*1000,o:+r[1],h:+r[2],l:+r[3],c:+r[4],v:+r[6]}));
+            chartCache[key]={candles,ts:Date.now()};
+            return candles;
+          }
+        }
+      }catch(e){console.warn('Chart Kraken failed:',e.message);}
+    }
   }
+
+  // Last resort: use daily candles from main cache
+  return (cryptoCache[ticker]?.candles||[]).slice(-limit);
 }
 
 async function searchStocks(q){
@@ -1197,16 +1294,15 @@ async function renderDetail(ticker,type){
       const curV=data.price*hold.shares,cost=hold.avgPrice*hold.shares,pnlA=curV-cost,pnlP=(pnlA/cost)*100;
       holdBanner=`<div class="hold-banner">You own <strong style="color:var(--bright);">${fmtShares(hold.shares,type)} ${ticker}</strong> · avg $${isC?fmtCryptoPrice(hold.avgPrice):fmt(hold.avgPrice)} &nbsp;·&nbsp; <strong class="${cc(pnlA)}">${pnlA>=0?'+':''}$${fmtD(Math.abs(pnlA))} (${pct(pnlP)})</strong></div>`;
     }
-    let deepHtml='';
+    let chartHtml='', indicatorsHtml='';
     if(isDeep){
       const cards=sig.votes.map(v=>`<div class="ind-card" onclick="openLearnById('${v.learnId}')">
         <div class="ind-top"><span class="ind-name">${v.name}</span><span class="ind-badge ${v.dir}">${v.dir.toUpperCase()}</span></div>
         <div class="ind-val">${v.val}</div><div class="ind-plain">${v.plain}</div>
         <div class="ind-tap">Tap to learn what ${v.name} means →</div></div>`).join('');
+      indicatorsHtml=`<div class="sec-hdr" style="padding:11px 16px 5px;">INDICATOR BREAKDOWN</div>${cards}`;
       if(isC){
-        // Crypto: timeframe toggle, default 1m
-        deepHtml=`<div class="sec-hdr" style="padding:11px 16px 5px;">INDICATOR BREAKDOWN</div>${cards}
-          <div class="chart-wrap">
+        chartHtml=`<div class="chart-wrap" style="margin-top:10px;">
             <div class="chart-header">
               <span class="chart-lbl" id="chartLbl">PRICE · LAST 50 MIN · 1M CANDLES</span>
               <div class="chart-tf-row">
@@ -1218,9 +1314,7 @@ async function renderDetail(ticker,type){
             <canvas id="dtChart" height="150"></canvas>
           </div>`;
       }else{
-        // Stocks: daily only, no toggle needed
-        deepHtml=`<div class="sec-hdr" style="padding:11px 16px 5px;">INDICATOR BREAKDOWN</div>${cards}
-          <div class="chart-wrap">
+        chartHtml=`<div class="chart-wrap" style="margin-top:10px;">
             <div class="chart-header">
               <span class="chart-lbl">PRICE · LAST 60 DAYS · DAILY</span>
             </div>
@@ -1248,12 +1342,13 @@ async function renderDetail(ticker,type){
         <button class="move-btn ${isC?'crypto-btn':''}" onclick="openTrade('${ticker}','${type}')">Make a Move 💰</button>
         <button class="alert-row-btn" onclick="openAlertModal('${ticker}','${type}')">🔔 Set a Price Alert</button>
       </div>
+      ${chartHtml}
       ${holdBanner}
       <div class="section-card" style="margin-bottom:10px;">
         <div class="sec-toggle" onclick="toggleSection(this,'why-items')">🔍 Why did it say ${sig.signal}? <span style="margin-left:auto;">▼</span></div>
         <div id="why-items" class="hidden">${whyHtml}</div>
       </div>
-      ${deepHtml}<div style="height:14px;"></div>`;
+      ${indicatorsHtml}<div style="height:14px;"></div>`;
     if(isDeep){
       if(isC){
         // Crypto default: 1-minute chart
@@ -1269,8 +1364,13 @@ async function renderDetail(ticker,type){
     }
   }catch(e){
     c.innerHTML=`<div class="detail-back" onclick="showView('markets')">← Back</div>
-      <div class="empty"><div class="empty-icon">⚠️</div><div class="empty-title">Couldn't load ${ticker}</div>
-      <div class="empty-text">Check your connection. Make sure the app is opened from its Netlify URL — not a downloaded file.<br><br>${e.message}</div></div>`;
+      <div class="empty">
+        <div class="empty-icon">📡</div>
+        <div class="empty-title">Having trouble loading ${ticker}</div>
+        <div class="empty-text" style="margin-bottom:20px;">The app tried 4 different data sources and couldn't reach any of them right now. This usually means a slow connection — just try again!</div>
+        <button onclick="showView('detail','${state.detailTicker}','${state.detailType}')" style="padding:14px 28px;border-radius:12px;background:var(--blue);color:#fff;font-size:15px;font-weight:800;border:none;cursor:pointer;margin-bottom:10px;display:block;width:calc(100% - 32px);margin:0 auto 10px;">↻ Try Again</button>
+        <button onclick="showView('markets')" style="padding:12px 28px;border-radius:12px;background:transparent;color:var(--text);font-size:14px;font-weight:700;border:1px solid var(--border);cursor:pointer;display:block;width:calc(100% - 32px);margin:0 auto;">← Back to Markets</button>
+      </div>`;
   }
 }
 
