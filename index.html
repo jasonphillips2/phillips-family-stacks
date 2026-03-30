@@ -103,14 +103,19 @@ html,body{background:var(--bg);font-family:'Nunito',sans-serif;color:var(--text)
 .hot-scroll::-webkit-scrollbar{display:none;}
 .hot-card{flex-shrink:0;width:140px;background:var(--surface);border:1px solid rgba(0,232,122,.25);border-radius:14px;padding:14px;cursor:pointer;transition:all .15s;}
 .hot-card:active{transform:scale(.96);background:var(--surface2);}
+.hot-card.hot-card-crypto{border-color:rgba(255,179,64,.3);background:rgba(255,179,64,.04);}
 .hot-card-emoji{font-size:24px;margin-bottom:6px;}
 .hot-card-ticker{font-family:'Orbitron',sans-serif;font-size:14px;font-weight:700;color:var(--bright);}
 .hot-card-name{font-size:11px;color:var(--text);margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
 .hot-card-chg{font-size:14px;font-weight:800;margin-top:5px;}
 .hot-card-sig{font-size:11px;padding:2px 8px;border-radius:8px;margin-top:4px;display:inline-block;background:rgba(0,232,122,.15);color:var(--green);border:1px solid rgba(0,232,122,.3);}
+.hot-card-sig.hot-card-sig-crypto{background:rgba(255,179,64,.15);color:var(--amber);border-color:rgba(255,179,64,.3);}
 .hot-loading{font-size:13px;color:var(--dim);padding:18px;text-align:center;width:100%;}
 .hot-empty{font-size:13px;color:var(--dim);padding:10px 4px;}
 .hot-divider{margin:0 12px 4px;height:1px;background:var(--border);}
+.hot-age{font-size:10px;color:var(--dim);font-family:'Share Tech Mono',monospace;letter-spacing:1px;}
+.hot-refresh-btn{font-size:10px;color:var(--dim);background:transparent;border:1px solid var(--border);border-radius:6px;padding:2px 8px;cursor:pointer;font-family:'Share Tech Mono',monospace;-webkit-appearance:none;}
+.hot-refresh-btn:active{background:var(--surface2);}
 
 /* CRYPTO LIVE BAR */
 .crypto-live-bar{display:flex;align-items:center;justify-content:space-between;padding:8px 16px;background:rgba(255,179,64,.07);border-bottom:1px solid rgba(255,179,64,.2);}
@@ -1040,63 +1045,138 @@ function showView(view,ticker=null,type=null){
 // ═══════════════════════════════════════════════════════════════════
 // HOT STOCKS — fetch gainers + trending, filter BUY signals
 // ═══════════════════════════════════════════════════════════════════
-let hotStockResults=[];
+// ═══════════════════════════════════════════════════════════════════
+// HOT MOVERS — cached 1 hour, works for stocks AND crypto
+// ═══════════════════════════════════════════════════════════════════
+const HOT_TTL = 60 * 60 * 1000; // 1 hour in ms
+const hotCache = { stocks: null, crypto: null }; // {results:[], ts: Date}
+
+function hotCacheValid(type){
+  const c = hotCache[type];
+  return c && c.results && (Date.now() - c.ts) < HOT_TTL;
+}
+
+function hotCacheAge(type){
+  const c = hotCache[type];
+  if(!c) return null;
+  const mins = Math.floor((Date.now() - c.ts) / 60000);
+  return mins < 1 ? 'just now' : mins + 'm ago';
+}
 
 async function fetchHotStocks(){
-  // Try Yahoo day gainers first
   try{
-    const url='https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved?formatted=false&lang=en-US&region=US&scrIds=day_gainers&count=20&start=0';
+    const url='https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved?formatted=false&lang=en-US&region=US&scrIds=day_gainers&count=25&start=0';
     const d=await fetchWithProxy(url);
-    const quotes=(d?.finance?.result?.[0]?.quotes||[]).slice(0,20);
+    const quotes=(d?.finance?.result?.[0]?.quotes||[]).slice(0,25);
     return quotes.map(q=>({symbol:q.symbol,name:q.shortName||q.longName||q.symbol,chgPct:q.regularMarketChangePercent||0}));
   }catch(e){console.warn('Gainers failed',e.message);}
-  // Fallback: Yahoo trending
   try{
-    const d2=await fetchWithProxy('https://query1.finance.yahoo.com/v2/finance/trending/US?count=20');
-    const quotes=(d2?.finance?.result?.[0]?.quotes||[]).slice(0,20);
+    const d2=await fetchWithProxy('https://query1.finance.yahoo.com/v2/finance/trending/US?count=25');
+    const quotes=(d2?.finance?.result?.[0]?.quotes||[]).slice(0,25);
     return quotes.map(q=>({symbol:q.symbol,name:q.symbol,chgPct:0}));
   }catch(e){console.warn('Trending failed',e.message);}
   return [];
 }
 
-async function loadHotStocks(){
-  const el=document.getElementById('hotScrollEl');
-  if(!el)return;
-  el.innerHTML=`<div class="hot-loading">🔍 Finding today\'s opportunities...</div>`;
+async function fetchHotCrypto(){
+  // Use CoinGecko top gainers (24h) — free, no key needed
   try{
-    const candidates=await fetchHotStocks();
-    const buyResults=[];
-    // Load data for each candidate and compute signal
-    for(const c of candidates.slice(0,15)){
-      if(buyResults.length>=8)break;
+    const d=await fetchWithProxy('https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=percent_change_24h_desc&per_page=25&page=1&sparkline=false&price_change_percentage=24h');
+    if(Array.isArray(d)){
+      return d
+        .filter(c=>c.price_change_percentage_24h>0)
+        .map(c=>({
+          symbol: c.symbol.toUpperCase(),
+          name: c.name,
+          cgId: c.id,
+          chgPct: c.price_change_percentage_24h||0
+        }));
+    }
+  }catch(e){console.warn('CoinGecko top gainers failed',e.message);}
+  // Fallback: compute from our own crypto cache — just pick biggest movers
+  const results=[];
+  for(const [t,data] of Object.entries(cryptoCache)){
+    if(data.price&&data.prevClose){
+      const chg=((data.price-data.prevClose)/data.prevClose)*100;
+      results.push({symbol:t,name:CRYPTO[t]?.name||t,chgPct:chg});
+    }
+  }
+  return results.sort((a,b)=>b.chgPct-a.chgPct);
+}
+
+async function loadHotMovers(type){
+  const elId = type==='crypto' ? 'hotCryptoEl' : 'hotScrollEl';
+  const el = document.getElementById(elId);
+  if(!el) return;
+
+  // Show cached results instantly if valid
+  if(hotCacheValid(type)){
+    renderHotCards(el, hotCache[type].results, type);
+    // Update the age label
+    const ageEl=document.getElementById('hot-age-'+type);
+    if(ageEl) ageEl.textContent='updated '+hotCacheAge(type);
+    return;
+  }
+
+  el.innerHTML=`<div class="hot-loading">${type==='crypto'?'🪙':'📈'} Scanning for top movers...</div>`;
+
+  try{
+    const candidates = type==='crypto' ? await fetchHotCrypto() : await fetchHotStocks();
+    const results=[];
+
+    for(const c of candidates.slice(0,20)){
+      if(results.length>=8) break;
       try{
-        const data=await fetchStock(c.symbol);
-        const sig=computeSignal(c.symbol,data,false);
+        // Store cgId for searched crypto
+        if(type==='crypto'&&c.cgId) cgIdMap[c.symbol]=c.cgId;
+        const data = type==='crypto' ? await fetchCrypto(c.symbol) : await fetchStock(c.symbol);
+        const sig = computeSignal(c.symbol, data, type==='crypto');
         if(sig.signal==='BUY'){
           const chgV=(data.price-data.prevClose)/data.prevClose*100;
-          const s=STOCKS[c.symbol]||{emoji:'📈',name:c.name||c.symbol};
-          buyResults.push({ticker:c.symbol,name:s.name,emoji:s.emoji,price:data.price,chgV,sig});
+          const info = type==='crypto'
+            ? (CRYPTO[c.symbol]||{emoji:'🪙',name:c.name||c.symbol})
+            : (STOCKS[c.symbol]||{emoji:'📈',name:c.name||c.symbol});
+          results.push({ticker:c.symbol, name:info.name, emoji:info.emoji, price:data.price, chgV, sig, type});
         }
-      }catch(e){}
+      }catch(e){ console.warn('Hot mover failed:',c.symbol,e.message); }
       await new Promise(r=>setTimeout(r,250));
     }
-    hotStockResults=buyResults;
-    if(!el)return;
-    if(buyResults.length===0){
-      el.innerHTML=`<div class="hot-empty">Markets are mostly bearish today — a good day to watch, not trade 📉</div>`;
-    }else{
-      el.innerHTML=buyResults.map(r=>`
-        <div class="hot-card" onclick="showView('detail','${r.ticker}','stock')">
-          <div class="hot-card-emoji">${r.emoji}</div>
-          <div class="hot-card-ticker">${r.ticker}</div>
-          <div class="hot-card-name">${r.name}</div>
-          <div class="hot-card-chg ${cc(r.chgV)}">${r.chgV>=0?'+':''}${r.chgV.toFixed(2)}%</div>
-          <div class="hot-card-sig">BUY</div>
-        </div>`).join('');
-    }
+
+    // Cache the results with timestamp
+    hotCache[type] = { results, ts: Date.now() };
+
+    if(!document.getElementById(elId)) return; // navigated away
+    renderHotCards(document.getElementById(elId), results, type);
+
+    const ageEl=document.getElementById('hot-age-'+type);
+    if(ageEl) ageEl.textContent='updated just now';
+
   }catch(e){
-    if(el)el.innerHTML=`<div class="hot-empty">Couldn't load opportunities right now</div>`;
+    if(el) el.innerHTML=`<div class="hot-empty">Couldn't load right now — tap refresh to try again</div>`;
   }
+}
+
+function renderHotCards(el, results, type){
+  if(!el) return;
+  const isC = type==='crypto';
+  if(results.length===0){
+    el.innerHTML=`<div class="hot-empty">${isC?'Crypto is mostly bearish right now 📉 — good time to watch':'Markets are mostly bearish today — a good day to watch 📉'}</div>`;
+    return;
+  }
+  el.innerHTML = results.map(r=>`
+    <div class="hot-card ${isC?'hot-card-crypto':''}" onclick="showView('detail','${r.ticker}','${type}')">
+      <div class="hot-card-emoji">${r.emoji}</div>
+      <div class="hot-card-ticker">${r.ticker}</div>
+      <div class="hot-card-name">${r.name}</div>
+      <div class="hot-card-chg ${cc(r.chgV)}">${r.chgV>=0?'+':''}${r.chgV.toFixed(2)}%</div>
+      <div class="hot-card-sig ${isC?'hot-card-sig-crypto':''}">BUY</div>
+    </div>`).join('');
+}
+
+function forceRefreshHot(type){
+  // Clear cache and reload
+  hotCache[type]=null;
+  loadHotMovers(type);
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -1176,19 +1256,30 @@ function renderMarkets(){
       autocomplete="off" autocorrect="off" autocapitalize="characters" spellcheck="false"></div>
     <div id="searchResults" class="hidden"></div>`;
 
-  // Hot opportunities (stocks only)
-  if(!isC){
-    html+=`<div class="hot-section">
-      <div class="hot-header">
-        <div>
-          <div class="hot-title">🔥 Hot Today</div>
-          <div class="hot-sub">BUY signals from today's top movers</div>
-        </div>
+  // Hot movers section — stocks AND crypto
+  const hotElId = isC ? 'hotCryptoEl' : 'hotScrollEl';
+  const hotIcon = isC ? '🚀' : '🔥';
+  const hotTitle = isC ? 'Hot Crypto Right Now' : 'Hot Stocks Today';
+  const hotSub = isC ? 'Top 24h gainers with BUY signals' : 'Top day gainers with BUY signals';
+  const cachedAge = hotCacheValid(isC?'crypto':'stocks') ? 'updated '+hotCacheAge(isC?'crypto':'stocks') : '';
+  const preload = hotCacheValid(isC?'crypto':'stocks')
+    ? '' // will render immediately from cache
+    : `<div class="hot-loading">${hotIcon} Scanning for top movers...</div>`;
+
+  html+=`<div class="hot-section">
+    <div class="hot-header">
+      <div>
+        <div class="hot-title">${hotIcon} ${hotTitle}</div>
+        <div class="hot-sub">${hotSub}</div>
       </div>
-      <div class="hot-scroll" id="hotScrollEl"><div class="hot-loading">Scanning the market...</div></div>
+      <div style="display:flex;flex-direction:column;align-items:flex-end;gap:4px;">
+        <span class="hot-age" id="hot-age-${isC?'crypto':'stocks'}">${cachedAge}</span>
+        <button class="hot-refresh-btn" onclick="forceRefreshHot('${isC?'crypto':'stocks'}')">↻ refresh</button>
+      </div>
     </div>
-    <div class="hot-divider"></div>`;
-  }
+    <div class="hot-scroll" id="${hotElId}">${preload}</div>
+  </div>
+  <div class="hot-divider"></div>`;
 
   for(const cat of cats){
     const tickers=Object.entries(list).filter(([,s])=>s.cat===cat).map(([t])=>t);
@@ -1197,7 +1288,8 @@ function renderMarkets(){
   }
   c.innerHTML=html;
   loadModeBg();
-  if(!isC)setTimeout(loadHotStocks,200);
+  // Load hot movers — uses cache if fresh, otherwise fetches
+  setTimeout(()=>loadHotMovers(isC?'crypto':'stocks'), 100);
 }
 
 function assetCardHTML(ticker,type){
