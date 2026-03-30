@@ -1141,24 +1141,52 @@ async function fetchHotStocks(){
 }
 
 async function fetchHotCrypto(){
-  // FIX: fetch with price_change_percentage=24h and sort ourselves — CoinGecko doesn't support order by 24h change directly
+  // ── Source 1: Binance 24hr ticker — returns ALL ~500 USDT pairs ranked by change ──
+  // This is the only way to find real gainers across the whole market, not just top 100 caps
   try{
-    const d=await fetchWithProxy('https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=100&page=1&sparkline=false&price_change_percentage=24h');
-    if(Array.isArray(d)&&d.length>0){
-      return d
-        .filter(c=>typeof c.price_change_percentage_24h_in_currency==='number'
-                || typeof c.price_change_percentage_24h==='number')
-        .map(c=>({
-          symbol: c.symbol.toUpperCase(),
-          name: c.name,
-          cgId: c.id,
-          chgPct: c.price_change_percentage_24h_in_currency||c.price_change_percentage_24h||0
+    const tickers=await fetchWithProxy('https://api.binance.com/api/v3/ticker/24hr');
+    if(Array.isArray(tickers)&&tickers.length>0){
+      return tickers
+        .filter(t=>{
+          if(!t.symbol.endsWith('USDT')) return false;
+          const chg=parseFloat(t.priceChangePercent);
+          const vol=parseFloat(t.quoteVolume);
+          // Must have real volume (>$500k traded today) and be genuinely up
+          return chg>0 && vol>500000;
+        })
+        .map(t=>({
+          symbol: t.symbol.replace('USDT',''),
+          name: t.symbol.replace('USDT',''),
+          chgPct: parseFloat(t.priceChangePercent),
+          vol: parseFloat(t.quoteVolume)
         }))
-        .sort((a,b)=>b.chgPct-a.chgPct)  // sort by 24h gain ourselves
+        .sort((a,b)=>b.chgPct-a.chgPct) // top gainers first
         .slice(0,35);
     }
-  }catch(e){console.warn('CoinGecko markets failed:',e.message);}
-  // Fallback: use our own crypto cache
+  }catch(e){console.warn('Binance 24hr tickers failed:',e.message);}
+
+  // ── Source 2: CoinGecko — broader page sweep ──
+  try{
+    // Fetch pages 1-3 to get beyond just top 100 large caps
+    const pages=await Promise.allSettled([1,2,3].map(page=>
+      fetchWithProxy(`https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=100&page=${page}&sparkline=false&price_change_percentage=24h`)
+    ));
+    const all=pages
+      .filter(p=>p.status==='fulfilled'&&Array.isArray(p.value))
+      .flatMap(p=>p.value);
+    if(all.length>0){
+      return all
+        .map(c=>({
+          symbol:c.symbol.toUpperCase(), name:c.name, cgId:c.id,
+          chgPct:c.price_change_percentage_24h||0
+        }))
+        .filter(c=>c.chgPct>0)
+        .sort((a,b)=>b.chgPct-a.chgPct)
+        .slice(0,35);
+    }
+  }catch(e){console.warn('CoinGecko sweep failed:',e.message);}
+
+  // ── Source 3: fallback to our own cache ──
   const results=[];
   for(const [t,data] of Object.entries(cryptoCache)){
     if(data.price&&data.prevClose){
