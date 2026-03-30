@@ -2256,8 +2256,8 @@ function markLearned(id){
 // INIT
 // ═══════════════════════════════════════════════════════════════════
 function init(){
-  let pct=0;
-  const iv=setInterval(()=>{pct=Math.min(pct+15,90);const f=document.getElementById('ldFill');if(f)f.style.width=pct+'%';},120);
+  let loadPct=0;
+  const iv=setInterval(()=>{loadPct=Math.min(loadPct+15,90);const f=document.getElementById('ldFill');if(f)f.style.width=loadPct+'%';},120);
   setTimeout(()=>{
     clearInterval(iv);
     const f=document.getElementById('ldFill');if(f)f.style.width='100%';
